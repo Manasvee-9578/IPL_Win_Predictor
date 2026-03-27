@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
+API_BASE = os.getenv("API_BASE", "https://ipl-win-predictor-6lve.onrender.com")
 LIVE_REFRESH_SECONDS = int(os.getenv("LIVE_REFRESH_SECONDS", "30"))
 
 # ---------------------------------------------------------------------------
