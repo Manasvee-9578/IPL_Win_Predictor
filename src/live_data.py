@@ -80,28 +80,27 @@ def _overs_to_balls(overs_float: float) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Helpers — live / IPL / T20 detection
 # ---------------------------------------------------------------------------
+_LIVE_KEYWORDS = [
+    "live", "in progress", "innings break", "batting", "bowling",
+    "required", "need", "trail", "lead", "opt to", "chasing",
+    "run", "won the toss",
+]
+
+
 def _is_live_match(match: dict) -> bool:
     """
-    Determine if a match is currently live using flexible detection.
-    Does NOT rely strictly on matchStarted / matchEnded because CricAPI
-    sometimes reports inconsistent values for these fields.
+    Flexible live detection — does NOT rely strictly on matchStarted / matchEnded.
     """
     status = (match.get("status") or "").lower()
     started = match.get("matchStarted", False)
     ended = match.get("matchEnded", False)
 
-    # Primary: check status text for live-indicating keywords
-    live_keywords = ["live", "in progress", "innings break", "batting", "bowling",
-                     "required", "need", "trail", "lead", "opt to"]
-    if any(kw in status for kw in live_keywords):
+    if any(kw in status for kw in _LIVE_KEYWORDS):
         return True
-
-    # Fallback: trust matchStarted when matchEnded is explicitly False/absent
     if started and not ended:
         return True
-
     return False
 
 
@@ -111,38 +110,169 @@ def _is_ipl_series(series: str) -> bool:
     return any(tag in s for tag in ["ipl", "indian premier league", "tata ipl"])
 
 
-def fetch_live_match() -> dict | None:
-    """
-    Call CricAPI /currentMatches and return a dict for the first
-    live IPL 2nd-innings match found, or None.
+def _is_t20(match_type: str) -> bool:
+    """Accept any T20 variant."""
+    return match_type.lower() in ("t20", "t20i")
 
-    Returned dict keys match MatchState fields:
-        batting_team, bowling_team, venue, toss_winner,
-        target_score, current_score, wickets_fallen, balls_bowled,
-        batting_team_form, head_to_head_ratio
-    """
-    if not API_KEY or API_KEY == "your_key_here":
-        print("[live_data] ⚠ No valid API key configured.")
-        return None
 
+# ---------------------------------------------------------------------------
+# API call helper — abstracts a single CricAPI endpoint
+# ---------------------------------------------------------------------------
+def _fetch_matches_from_endpoint(endpoint: str) -> list[dict]:
+    """
+    Hit a CricAPI v1 endpoint and return the match list (may be empty).
+    Works for /currentMatches, /matches, /cricScore.
+    """
+    url = f"{CRICAPI_BASE}/{endpoint}"
     try:
         resp = requests.get(
-            f"{CRICAPI_BASE}/currentMatches",
+            url,
             params={"apikey": API_KEY, "offset": 0},
             timeout=10,
         )
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        print(f"[live_data] ❌ API request failed: {exc}")
-        return None
+        print(f"[live_data] ❌ /{endpoint} request failed: {exc}")
+        return []
 
     if data.get("status") != "success":
-        print(f"[live_data] ❌ API returned non-success status: {data.get('status')}")
-        return None
+        print(f"[live_data] ❌ /{endpoint} returned status: {data.get('status')}")
+        return []
 
     matches = data.get("data", [])
-    print(f"[live_data] 📡 Received {len(matches)} matches from CricAPI")
+    print(f"[live_data] 📡 /{endpoint} → {len(matches)} matches")
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# Single-match data extraction
+# ---------------------------------------------------------------------------
+def _extract_match_data(match: dict) -> dict | None:
+    """
+    Try to build the output dict from a single match object.
+    Returns None if the match doesn't have enough data (e.g. no 2nd innings).
+    """
+    # --- Extract match info ---
+    venue = match.get("venue", "Unknown")
+
+    # Toss
+    toss_winner_raw = match.get("tossWinner", "")
+    toss_winner = _normalise_team(toss_winner_raw) if toss_winner_raw else "Unknown"
+
+    # Teams
+    teams_info = match.get("teamInfo") or []
+    team_names = []
+    for t in teams_info:
+        name = (t.get("name") or t.get("shortname") or "").strip()
+        if name:
+            team_names.append(_normalise_team(name))
+
+    if len(team_names) < 2:
+        raw_teams = match.get("teams") or []
+        team_names = [_normalise_team(t) for t in raw_teams if t]
+
+    if len(team_names) < 2:
+        print(f"[live_data]  │   ⏭ Skipped: could not identify two teams")
+        return None
+
+    # --- Score data ---
+    score_list = match.get("score") or []
+    if not score_list:
+        print(f"[live_data]  │   ⏭ Skipped: no score data available")
+        return None
+
+    print(f"[live_data]  │   Score entries ({len(score_list)}):")
+    for si, s in enumerate(score_list):
+        print(f"[live_data]  │     [{si}] {s.get('inning', '?')} — "
+              f"r={s.get('r')}, w={s.get('w')}, o={s.get('o')}")
+
+    # Find innings by label first, then fall back to position
+    second_innings = None
+    first_innings = None
+    for s in score_list:
+        inning_str = (s.get("inning") or "").lower()
+        if "2nd" in inning_str or "inning 2" in inning_str:
+            second_innings = s
+        elif "1st" in inning_str or "inning 1" in inning_str:
+            first_innings = s
+
+    # Positional fallback
+    if first_innings is None and len(score_list) >= 1:
+        first_innings = score_list[0]
+    if second_innings is None and len(score_list) >= 2:
+        second_innings = score_list[1]
+
+    # 2nd innings is mandatory; 1st innings can be missing → default 0
+    if second_innings is None:
+        print(f"[live_data]  │   ⏭ Skipped: no 2nd innings data found")
+        return None
+
+    # --- Parse innings data ---
+    first_runs = (first_innings.get("r", 0) if first_innings else 0) or 0
+    target_score = first_runs + 1
+
+    current_score = second_innings.get("r", 0) or 0
+    wickets_fallen = second_innings.get("w", 0) or 0
+    overs_raw = second_innings.get("o", 0) or 0
+
+    try:
+        overs_float = float(overs_raw)
+    except (ValueError, TypeError):
+        overs_float = 0.0
+
+    balls_bowled = _overs_to_balls(overs_float)
+
+    # Determine batting team from the 2nd innings label
+    inning_label = second_innings.get("inning") or ""
+    batting_team = None
+    for tn in team_names:
+        if tn.lower() in inning_label.lower():
+            batting_team = tn
+            break
+
+    if batting_team is None:
+        batting_team = team_names[1]
+
+    bowling_team = (
+        team_names[0] if batting_team == team_names[1] else team_names[1]
+    )
+
+    print(f"[live_data]  └─ 🏏 Match data: {batting_team} vs {bowling_team} | "
+          f"target={target_score} current={current_score}/{wickets_fallen} "
+          f"({overs_float} ov)")
+
+    return {
+        "batting_team": batting_team,
+        "bowling_team": bowling_team,
+        "venue": venue,
+        "toss_winner": toss_winner,
+        "target_score": target_score,
+        "current_score": current_score,
+        "wickets_fallen": wickets_fallen,
+        "balls_bowled": min(balls_bowled, 120),
+        "batting_team_form": 0.5,
+        "head_to_head_ratio": 0.5,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Search a match list — returns (ipl_result, best_t20_fallback)
+# ---------------------------------------------------------------------------
+def _search_matches(
+    matches: list[dict],
+    source_label: str,
+) -> tuple[dict | None, dict | None]:
+    """
+    Scan *matches* for:
+      1. A live IPL T20 match with 2nd-innings data  → ipl_result
+      2. Any live T20 match with 2nd-innings data     → t20_fallback
+
+    Returns (ipl_result, t20_fallback).  Either may be None.
+    """
+    ipl_result: dict | None = None
+    t20_fallback: dict | None = None
 
     for idx, match in enumerate(matches):
         match_name = match.get("name", "Unknown")
@@ -150,136 +280,89 @@ def fetch_live_match() -> dict | None:
         series = match.get("series") or ""
         status = match.get("status") or ""
 
-        print(f"[live_data]  ├─ Match {idx}: {match_name}")
+        print(f"[live_data]  ├─ [{source_label}] Match {idx}: {match_name}")
         print(f"[live_data]  │   series={series}  type={match_type}  status={status}")
         print(f"[live_data]  │   matchStarted={match.get('matchStarted')}  "
               f"matchEnded={match.get('matchEnded')}")
 
-        # --- IPL filter (case-insensitive, partial match) ---
-        if not _is_ipl_series(series):
-            print(f"[live_data]  │   ⏭ Skipped: not an IPL series")
-            continue
-
-        # --- T20 filter ---
-        is_t20 = match_type in ("t20", "t20i")
-        if not is_t20:
+        # --- T20 check ---
+        if not _is_t20(match_type):
             print(f"[live_data]  │   ⏭ Skipped: matchType '{match_type}' is not T20")
             continue
 
-        # --- Live detection (flexible) ---
+        # --- Live check ---
         if not _is_live_match(match):
             print(f"[live_data]  │   ⏭ Skipped: match does not appear live")
             continue
 
-        print(f"[live_data]  │   ✅ Passed filters — extracting match data …")
-
-        # --- Extract match info ---
-        venue = match.get("venue", "Unknown")
-
-        # Toss
-        toss_winner_raw = match.get("tossWinner", "")
-        toss_winner = _normalise_team(toss_winner_raw) if toss_winner_raw else "Unknown"
-
-        # Teams
-        teams_info = match.get("teamInfo") or []
-        team_names = []
-        for t in teams_info:
-            name = (t.get("name") or t.get("shortname") or "").strip()
-            if name:
-                team_names.append(_normalise_team(name))
-
-        if len(team_names) < 2:
-            # Fallback: try the teams list
-            raw_teams = match.get("teams") or []
-            team_names = [_normalise_team(t) for t in raw_teams if t]
-
-        if len(team_names) < 2:
-            print(f"[live_data]  │   ⏭ Skipped: could not identify two teams")
+        # --- Try to extract data ---
+        print(f"[live_data]  │   ✅ Passed live+T20 filters — extracting …")
+        result = _extract_match_data(match)
+        if result is None:
             continue
 
-        # --- Score data ---
-        score_list = match.get("score") or []
-        if not score_list:
-            print(f"[live_data]  │   ⏭ Skipped: no score data available")
+        # --- IPL check ---
+        if _is_ipl_series(series):
+            print(f"[live_data]  │   🏆 IPL match found!")
+            ipl_result = result
+            return ipl_result, t20_fallback  # IPL takes priority, return immediately
+
+        # Keep the first non-IPL T20 result as fallback
+        if t20_fallback is None:
+            print(f"[live_data]  │   📋 Stored as T20 fallback (not IPL)")
+            t20_fallback = result
+
+    return ipl_result, t20_fallback
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+def fetch_live_match() -> dict | None:
+    """
+    Find a live IPL match with 2nd-innings data and return a dict
+    matching the MatchState schema. Uses multiple CricAPI endpoints
+    as fallbacks and, as a last resort, returns any live T20 match.
+
+    Endpoint priority:
+        1. /currentMatches   (most granular, but sometimes incomplete)
+        2. /cricScore         (±7-day window, simplified scores)
+        3. /matches           (general match list)
+
+    Returned dict keys:
+        batting_team, bowling_team, venue, toss_winner,
+        target_score, current_score, wickets_fallen, balls_bowled,
+        batting_team_form, head_to_head_ratio, last_updated
+    """
+    if not API_KEY or API_KEY == "your_key_here":
+        print("[live_data] ⚠ No valid API key configured.")
+        return None
+
+    # Endpoints to try, in priority order
+    endpoints = ["currentMatches", "cricScore", "matches"]
+
+    best_t20_fallback: dict | None = None
+
+    for ep in endpoints:
+        print(f"\n[live_data] ── Trying /{ep} ──")
+        matches = _fetch_matches_from_endpoint(ep)
+        if not matches:
             continue
 
-        print(f"[live_data]  │   Score entries ({len(score_list)}):")
-        for si, s in enumerate(score_list):
-            print(f"[live_data]  │     [{si}] {s.get('inning','?')} — "
-                  f"r={s.get('r')}, w={s.get('w')}, o={s.get('o')}")
+        ipl_result, t20_fb = _search_matches(matches, ep)
 
-        # Find innings by label first, then fall back to position
-        second_innings = None
-        first_innings = None
-        for s in score_list:
-            inning_str = (s.get("inning") or "").lower()
-            if "2nd" in inning_str or "inning 2" in inning_str:
-                second_innings = s
-            elif "1st" in inning_str or "inning 1" in inning_str:
-                first_innings = s
+        if ipl_result is not None:
+            print(f"[live_data] ✅ Returning IPL match from /{ep}")
+            return ipl_result
 
-        # Positional fallback
-        if first_innings is None and len(score_list) >= 1:
-            first_innings = score_list[0]
-        if second_innings is None and len(score_list) >= 2:
-            second_innings = score_list[1]
+        # Keep the best T20 fallback across endpoints
+        if t20_fb is not None and best_t20_fallback is None:
+            best_t20_fallback = t20_fb
 
-        # 2nd innings is mandatory; 1st innings can be missing → default 0
-        if second_innings is None:
-            print(f"[live_data]  │   ⏭ Skipped: no 2nd innings data found")
-            continue
+    # --- Fallback: return any live T20 match ---
+    if best_t20_fallback is not None:
+        print("[live_data] ⚠ No IPL match found — returning best live T20 fallback")
+        return best_t20_fallback
 
-        # --- Parse innings data ---
-        # 1st innings → target (default to 0 if missing)
-        first_runs = (first_innings.get("r", 0) if first_innings else 0) or 0
-        target_score = first_runs + 1  # target = 1st innings total + 1
-
-        # 2nd innings → current state
-        current_score = second_innings.get("r", 0) or 0
-        wickets_fallen = second_innings.get("w", 0) or 0
-        overs_raw = second_innings.get("o", 0) or 0
-
-        try:
-            overs_float = float(overs_raw)
-        except (ValueError, TypeError):
-            overs_float = 0.0
-
-        balls_bowled = _overs_to_balls(overs_float)
-
-        # Determine batting team from the 2nd innings label
-        inning_label = second_innings.get("inning") or ""
-        batting_team = None
-        for tn in team_names:
-            if tn.lower() in inning_label.lower():
-                batting_team = tn
-                break
-
-        if batting_team is None:
-            # Fallback: 2nd team in list is usually chasing
-            batting_team = team_names[1]
-
-        bowling_team = (
-            team_names[0] if batting_team == team_names[1] else team_names[1]
-        )
-
-        print(f"[live_data]  └─ 🏏 Returning: {batting_team} vs {bowling_team} | "
-              f"target={target_score} current={current_score}/{wickets_fallen} "
-              f"({overs_float} ov)")
-
-        return {
-            "batting_team": batting_team,
-            "bowling_team": bowling_team,
-            "venue": venue,
-            "toss_winner": toss_winner,
-            "target_score": target_score,
-            "current_score": current_score,
-            "wickets_fallen": wickets_fallen,
-            "balls_bowled": min(balls_bowled, 120),
-            "batting_team_form": 0.5,       # neutral default for live
-            "head_to_head_ratio": 0.5,       # neutral default for live
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        }
-
-    # No live IPL match found
-    print("[live_data] ℹ No live IPL 2nd-innings match found in current matches.")
+    print("[live_data] ℹ No live match found across all endpoints.")
     return None
