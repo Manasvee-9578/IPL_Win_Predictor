@@ -82,6 +82,35 @@ def _overs_to_balls(overs_float: float) -> int:
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+def _is_live_match(match: dict) -> bool:
+    """
+    Determine if a match is currently live using flexible detection.
+    Does NOT rely strictly on matchStarted / matchEnded because CricAPI
+    sometimes reports inconsistent values for these fields.
+    """
+    status = (match.get("status") or "").lower()
+    started = match.get("matchStarted", False)
+    ended = match.get("matchEnded", False)
+
+    # Primary: check status text for live-indicating keywords
+    live_keywords = ["live", "in progress", "innings break", "batting", "bowling",
+                     "required", "need", "trail", "lead", "opt to"]
+    if any(kw in status for kw in live_keywords):
+        return True
+
+    # Fallback: trust matchStarted when matchEnded is explicitly False/absent
+    if started and not ended:
+        return True
+
+    return False
+
+
+def _is_ipl_series(series: str) -> bool:
+    """Case-insensitive partial match for IPL series variants."""
+    s = series.lower()
+    return any(tag in s for tag in ["ipl", "indian premier league", "tata ipl"])
+
+
 def fetch_live_match() -> dict | None:
     """
     Call CricAPI /currentMatches and return a dict for the first
@@ -93,6 +122,7 @@ def fetch_live_match() -> dict | None:
         batting_team_form, head_to_head_ratio
     """
     if not API_KEY or API_KEY == "your_key_here":
+        print("[live_data] ⚠ No valid API key configured.")
         return None
 
     try:
@@ -103,83 +133,111 @@ def fetch_live_match() -> dict | None:
         )
         resp.raise_for_status()
         data = resp.json()
-    except Exception:
+    except Exception as exc:
+        print(f"[live_data] ❌ API request failed: {exc}")
         return None
 
     if data.get("status") != "success":
+        print(f"[live_data] ❌ API returned non-success status: {data.get('status')}")
         return None
 
     matches = data.get("data", [])
+    print(f"[live_data] 📡 Received {len(matches)} matches from CricAPI")
 
-    for match in matches:
-        # Filter for IPL T20 matches that are currently live
+    for idx, match in enumerate(matches):
+        match_name = match.get("name", "Unknown")
         match_type = (match.get("matchType") or "").lower()
-        series = (match.get("series") or "").lower()
-        started = match.get("matchStarted", False)
-        ended = match.get("matchEnded", False)
+        series = match.get("series") or ""
+        status = match.get("status") or ""
 
-        is_ipl = "ipl" in series or "indian premier league" in series
-        is_t20 = match_type in ("t20", "t20i")
+        print(f"[live_data]  ├─ Match {idx}: {match_name}")
+        print(f"[live_data]  │   series={series}  type={match_type}  status={status}")
+        print(f"[live_data]  │   matchStarted={match.get('matchStarted')}  "
+              f"matchEnded={match.get('matchEnded')}")
 
-        if not (is_ipl and is_t20 and started and not ended):
+        # --- IPL filter (case-insensitive, partial match) ---
+        if not _is_ipl_series(series):
+            print(f"[live_data]  │   ⏭ Skipped: not an IPL series")
             continue
+
+        # --- T20 filter ---
+        is_t20 = match_type in ("t20", "t20i")
+        if not is_t20:
+            print(f"[live_data]  │   ⏭ Skipped: matchType '{match_type}' is not T20")
+            continue
+
+        # --- Live detection (flexible) ---
+        if not _is_live_match(match):
+            print(f"[live_data]  │   ⏭ Skipped: match does not appear live")
+            continue
+
+        print(f"[live_data]  │   ✅ Passed filters — extracting match data …")
 
         # --- Extract match info ---
         venue = match.get("venue", "Unknown")
 
         # Toss
         toss_winner_raw = match.get("tossWinner", "")
-        toss_winner = _normalise_team(toss_winner_raw)
+        toss_winner = _normalise_team(toss_winner_raw) if toss_winner_raw else "Unknown"
 
         # Teams
-        teams_info = match.get("teamInfo", [])
+        teams_info = match.get("teamInfo") or []
         team_names = []
         for t in teams_info:
-            name = t.get("name", "") or t.get("shortname", "")
-            team_names.append(_normalise_team(name))
+            name = (t.get("name") or t.get("shortname") or "").strip()
+            if name:
+                team_names.append(_normalise_team(name))
 
         if len(team_names) < 2:
             # Fallback: try the teams list
-            raw_teams = match.get("teams", [])
-            team_names = [_normalise_team(t) for t in raw_teams]
+            raw_teams = match.get("teams") or []
+            team_names = [_normalise_team(t) for t in raw_teams if t]
 
         if len(team_names) < 2:
+            print(f"[live_data]  │   ⏭ Skipped: could not identify two teams")
             continue
 
         # --- Score data ---
-        # CricAPI returns a "score" array with entries per innings
-        score_list = match.get("score", [])
+        score_list = match.get("score") or []
         if not score_list:
+            print(f"[live_data]  │   ⏭ Skipped: no score data available")
             continue
 
-        # Find 2nd innings entry
+        print(f"[live_data]  │   Score entries ({len(score_list)}):")
+        for si, s in enumerate(score_list):
+            print(f"[live_data]  │     [{si}] {s.get('inning','?')} — "
+                  f"r={s.get('r')}, w={s.get('w')}, o={s.get('o')}")
+
+        # Find innings by label first, then fall back to position
         second_innings = None
         first_innings = None
         for s in score_list:
-            inning_str = (s.get("inning", "") or "").lower()
+            inning_str = (s.get("inning") or "").lower()
             if "2nd" in inning_str or "inning 2" in inning_str:
                 second_innings = s
             elif "1st" in inning_str or "inning 1" in inning_str:
                 first_innings = s
 
-        # If we found no labelled innings, try by position
+        # Positional fallback
         if first_innings is None and len(score_list) >= 1:
             first_innings = score_list[0]
         if second_innings is None and len(score_list) >= 2:
             second_innings = score_list[1]
 
-        if second_innings is None or first_innings is None:
+        # 2nd innings is mandatory; 1st innings can be missing → default 0
+        if second_innings is None:
+            print(f"[live_data]  │   ⏭ Skipped: no 2nd innings data found")
             continue
 
         # --- Parse innings data ---
-        # 1st innings → target
-        first_runs = first_innings.get("r", 0)
+        # 1st innings → target (default to 0 if missing)
+        first_runs = (first_innings.get("r", 0) if first_innings else 0) or 0
         target_score = first_runs + 1  # target = 1st innings total + 1
 
         # 2nd innings → current state
-        current_score = second_innings.get("r", 0)
-        wickets_fallen = second_innings.get("w", 0)
-        overs_raw = second_innings.get("o", 0)
+        current_score = second_innings.get("r", 0) or 0
+        wickets_fallen = second_innings.get("w", 0) or 0
+        overs_raw = second_innings.get("o", 0) or 0
 
         try:
             overs_float = float(overs_raw)
@@ -189,7 +247,7 @@ def fetch_live_match() -> dict | None:
         balls_bowled = _overs_to_balls(overs_float)
 
         # Determine batting team from the 2nd innings label
-        inning_label = second_innings.get("inning", "")
+        inning_label = second_innings.get("inning") or ""
         batting_team = None
         for tn in team_names:
             if tn.lower() in inning_label.lower():
@@ -203,6 +261,10 @@ def fetch_live_match() -> dict | None:
         bowling_team = (
             team_names[0] if batting_team == team_names[1] else team_names[1]
         )
+
+        print(f"[live_data]  └─ 🏏 Returning: {batting_team} vs {bowling_team} | "
+              f"target={target_score} current={current_score}/{wickets_fallen} "
+              f"({overs_float} ov)")
 
         return {
             "batting_team": batting_team,
@@ -219,4 +281,5 @@ def fetch_live_match() -> dict | None:
         }
 
     # No live IPL match found
+    print("[live_data] ℹ No live IPL 2nd-innings match found in current matches.")
     return None
