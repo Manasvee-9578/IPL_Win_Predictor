@@ -1,360 +1,152 @@
 """
-IPL Win Probability Predictor — Feature Engineering
-====================================================
-Loads the cleaned ball-by-ball dataset, filters to 2nd-innings
-chases, and builds features that power the win-probability model.
+ChaseIQ - Feature Engineering (stage 2)
+=============================================================
+Adds *context* features that describe the two teams and the ground, then
+expands every chase state into the model's feature vector.
+
+Context features are computed strictly chronologically: the value attached
+to a match only uses matches played **before** it (no future leakage).
+
+* Elo rating       - every team starts at 1500, K=24, with 25% regression to
+                     the mean each season (squads change between auctions).
+* Form             - smoothed win ratio over the last 5 matches.
+* Head-to-head     - smoothed win ratio of the batting team vs this opponent.
+* Venue average    - shrunk mean 1st-innings score at the ground.
+* Venue chase bias - shrunk share of matches won by the chasing side.
 
 Usage:
-    python src/feature_engineering.py
+    python -m src.feature_engineering
 """
 
-import os
-import sys
-import warnings
+from collections import defaultdict
 
-import joblib
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
 
-warnings.filterwarnings("ignore")
+from src import config as C
+from src.features import make_features
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-PROCESSED_DIR = os.path.join("data", "processed")
-MODELS_DIR    = "models"
-INPUT_CSV     = os.path.join(PROCESSED_DIR, "ipl_cleaned.csv")
-OUTPUT_CSV    = os.path.join(PROCESSED_DIR, "ipl_features.csv")
-VENUE_ENC_PKL = os.path.join(MODELS_DIR, "venue_encoder.pkl")
+VENUE_PRIOR_WEIGHT = 3      # matches of pseudo-evidence for the prior mean
+CHASE_PRIOR_WEIGHT = 4
 
 
-# ===========================  HELPERS  =====================================
+class ContextState:
+    """Ratings that evolve match by match. After the last match it is the
+    *current* state used for live predictions."""
 
-def _first_innings_totals(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For every match, compute the 1st-innings total score.
-    Returns a DataFrame with columns [match_id, target_score].
-    """
-    first = df[df["innings"] == 1]
-    totals = (
-        first.groupby("match_id")["total_runs"]
-        .sum()
-        .reset_index()
-        .rename(columns={"total_runs": "target_score"})
+    def __init__(self):
+        self.elo = defaultdict(lambda: C.ELO_START)
+        self.history = defaultdict(list)                      # 1/0 results per team
+        self.h2h = defaultdict(lambda: [0, 0])                # (a, b) -> [a wins, games]
+        self.venue_sum = defaultdict(float)
+        self.venue_n = defaultdict(int)
+        self.venue_chase_wins = defaultdict(int)
+        self.season = None
+
+    # ---- read ---------------------------------------------------------
+    def form(self, team: int) -> float:
+        last = self.history[team][-C.FORM_WINDOW:]
+        return (sum(last) + 1.0) / (len(last) + 2.0)          # Laplace smoothing
+
+    def h2h_ratio(self, a: int, b: int) -> float:
+        wins, games = self.h2h[(a, b)]
+        return (wins + 1.0) / (games + 2.0)
+
+    def venue_avg(self, venue: str) -> float:
+        n = self.venue_n[venue]
+        return (self.venue_sum[venue] + VENUE_PRIOR_WEIGHT * C.PRIOR_FIRST_INNINGS) / (
+            n + VENUE_PRIOR_WEIGHT)
+
+    def venue_bias(self, venue: str) -> float:
+        n = self.venue_n[venue]
+        return (self.venue_chase_wins[venue] + CHASE_PRIOR_WEIGHT / 2) / (
+            n + CHASE_PRIOR_WEIGHT)
+
+    # ---- write --------------------------------------------------------
+    def new_season(self, season: int) -> None:
+        if self.season is not None and season != self.season:
+            for t in list(self.elo):
+                self.elo[t] = C.ELO_START + (self.elo[t] - C.ELO_START) * (
+                    1 - C.ELO_SEASON_REGRESSION)
+        self.season = season
+
+    def update(self, row) -> None:
+        t1, t2, winner = int(row.team1), int(row.team2), row.winner
+        if row.result in ("win", "tie") and pd.notna(winner):
+            winner = int(winner)
+            loser = t2 if winner == t1 else t1
+            expected = 1.0 / (1.0 + 10 ** ((self.elo[loser] - self.elo[winner]) / 400.0))
+            delta = C.ELO_K * (1.0 - expected)
+            self.elo[winner] += delta
+            self.elo[loser] -= delta
+            self.history[winner].append(1)
+            self.history[loser].append(0)
+            self.h2h[(winner, loser)][0] += 1
+            self.h2h[(winner, loser)][1] += 1
+            self.h2h[(loser, winner)][1] += 1
+        if row.valid_chase:
+            self.venue_sum[row.venue] += row.first_runs
+            self.venue_n[row.venue] += 1
+            self.venue_chase_wins[row.venue] += int(row.chasing_team_won)
+
+
+def compute_context(matches: pd.DataFrame) -> tuple[pd.DataFrame, ContextState]:
+    """Pre-match context for every match + the final state after the last match."""
+    state = ContextState()
+    records = []
+    for row in matches.sort_values(["match_date", "match_id"]).itertuples(index=False):
+        state.new_season(int(row.season))
+        t1, t2 = int(row.team1), int(row.team2)
+        records.append({
+            "match_id": row.match_id,
+            "elo1": state.elo[t1], "elo2": state.elo[t2],
+            "form1": state.form(t1), "form2": state.form(t2),
+            "h2h1": state.h2h_ratio(t1, t2), "h2h2": state.h2h_ratio(t2, t1),
+            "venue_avg": state.venue_avg(row.venue),
+            "venue_bias": state.venue_bias(row.venue),
+        })
+        state.update(row)
+    return pd.DataFrame(records), state
+
+
+def build_feature_table(states: pd.DataFrame, matches: pd.DataFrame) -> pd.DataFrame:
+    ctx, _ = compute_context(matches)
+    df = states.merge(ctx, on="match_id").merge(matches[["match_id", "team1"]], on="match_id")
+    bat_is_t1 = (df["batting_team"] == df["team1"]).to_numpy()
+
+    def pick(a: str, b: str) -> np.ndarray:
+        return np.where(bat_is_t1, df[a], df[b])
+
+    feats = make_features(
+        target_score=df["target_score"],
+        current_score=df["cum_runs"],
+        wickets_fallen=df["cum_wickets"],
+        balls_bowled=df["balls_bowled"],
+        elo_diff=pick("elo1", "elo2") - pick("elo2", "elo1"),
+        batting_team_form=pick("form1", "form2"),
+        head_to_head_ratio=pick("h2h1", "h2h2"),
+        venue_avg_score=df["venue_avg"],
+        venue_chase_bias=df["venue_bias"],
+        toss_advantage=df["toss_advantage"],
     )
-    return totals
+    meta = df[["match_id", "season", "balls_bowled", C.TARGET]].reset_index(drop=True)
+    return pd.concat([meta, feats.reset_index(drop=True)], axis=1)
 
-
-def _team_form(matches_df: pd.DataFrame, n: int = 5) -> dict:
-    """
-    Pre-compute a dictionary keyed by (team, match_id) → win-ratio
-    in the last *n* completed matches for that team prior to this match.
-
-    Parameters
-    ----------
-    matches_df : DataFrame
-        Must contain at least [match_id, team_batting, match_winner, season].
-        Should already be sorted by match_id (chronological).
-    n : int
-        Look-back window.
-
-    Returns
-    -------
-    dict  {(team, match_id): float}
-    """
-    # Deduplicate to one row per match for form calculation
-    # (use first occurrence per match_id — all rows in a match share the same winner)
-    match_level = (
-        matches_df.drop_duplicates(subset="match_id")[
-            ["match_id", "team_batting", "match_winner", "season"]
-        ]
-        .sort_values("match_id")
-        .reset_index(drop=True)
-    )
-
-    # Build set of all teams that appear in team_batting
-    teams = match_level["team_batting"].unique()
-
-    form: dict = {}
-
-    for team in teams:
-        # All matches this team participated in (as batting or bowling)
-        team_matches = match_level[
-            match_level["match_id"].isin(
-                matches_df.loc[
-                    (matches_df["team_batting"] == team)
-                    | (matches_df["team_bowling"] == team),
-                    "match_id",
-                ].unique()
-            )
-        ].sort_values("match_id")
-
-        wins_list: list[int] = []
-        for _, row in team_matches.iterrows():
-            mid = row["match_id"]
-            # Form based on *previous* matches only
-            if len(wins_list) == 0:
-                form[(team, mid)] = 0.5          # first match → neutral
-            else:
-                window = wins_list[-n:]
-                form[(team, mid)] = sum(window) / len(window)
-
-            # Record whether this team won
-            wins_list.append(1 if row["match_winner"] == team else 0)
-
-    return form
-
-
-def _head_to_head(matches_df: pd.DataFrame) -> dict:
-    """
-    Pre-compute historical head-to-head win ratio for every (teamA, teamB)
-    pair using only matches played *before* the current one.
-
-    Returns lookup entries for **both** team orderings per match so that
-    2nd-innings rows (where batting/bowling roles are swapped relative to
-    innings 1) can find the correct value.
-
-    Returns
-    -------
-    dict  {(team_a, team_b, match_id): float}
-    """
-    # Get the two teams per match (team1, team2 from the original matches
-    # columns survive the merge; fall back to batting/bowling from the
-    # first row if not available).
-    needed = ["match_id", "match_winner"]
-    if "team1" in matches_df.columns and "team2" in matches_df.columns:
-        needed += ["team1", "team2"]
-        use_team12 = True
-    else:
-        needed += ["team_batting", "team_bowling"]
-        use_team12 = False
-
-    match_level = (
-        matches_df.drop_duplicates(subset="match_id")[needed]
-        .sort_values("match_id")
-        .reset_index(drop=True)
-    )
-
-    h2h: dict = {}
-    pair_history: dict = {}          # canonical pair → [winner_name, ...]
-
-    for _, row in match_level.iterrows():
-        mid    = row["match_id"]
-        winner = row["match_winner"]
-
-        if use_team12:
-            t_a, t_b = row["team1"], row["team2"]
-        else:
-            t_a, t_b = row["team_batting"], row["team_bowling"]
-
-        pair = tuple(sorted([t_a, t_b]))
-        history = pair_history.get(pair, [])
-
-        if len(history) == 0:
-            ratio_a = 0.5
-            ratio_b = 0.5
-        else:
-            a_wins = sum(1 for w in history if w == t_a)
-            b_wins = sum(1 for w in history if w == t_b)
-            ratio_a = a_wins / len(history)
-            ratio_b = b_wins / len(history)
-
-        # Store for both orderings so look-ups from either innings work
-        h2h[(t_a, t_b, mid)] = ratio_a
-        h2h[(t_b, t_a, mid)] = ratio_b
-
-        pair_history.setdefault(pair, []).append(winner)
-
-    return h2h
-
-
-# ===========================  MAIN PIPELINE  ==============================
 
 def run() -> None:
-    # ------------------------------------------------------------------
-    # 1. Load cleaned data
-    # ------------------------------------------------------------------
-    print("=" * 60)
-    print("STEP 1 — Loading cleaned data")
-    print("=" * 60)
+    print("=" * 60 + "\nSTAGE 2 - FEATURE ENGINEERING\n" + "=" * 60)
+    matches = pd.read_csv(C.MATCHES_CLEAN_CSV)
+    states = pd.read_csv(C.CHASE_STATES_CSV)
 
-    if not os.path.isfile(INPUT_CSV):
-        sys.exit(f"  ✖ File not found: {INPUT_CSV}")
-    df = pd.read_csv(INPUT_CSV)
-    print(f"  ✔ Loaded {INPUT_CSV}  →  {df.shape}")
+    table = build_feature_table(states, matches)
+    table.to_csv(C.FEATURES_CSV, index=False)
+    print(f"  feature table : {table.shape}  -> {C.FEATURES_CSV.name}")
 
-    # ------------------------------------------------------------------
-    # 2. Get 1st-innings totals & filter to 2nd innings
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 2 — First-innings totals & 2nd-innings filter")
-    print("=" * 60)
-
-    totals = _first_innings_totals(df)
-    print(f"  ✔ Computed 1st-innings totals for {len(totals)} matches")
-
-    chase = df[df["innings"] == 2].copy()
-    print(f"  ✔ Filtered to 2nd innings  →  {chase.shape}")
-
-    chase = chase.merge(totals, on="match_id", how="left")
-    print(f"  ✔ Merged target_score  →  {chase.shape}")
-
-    # ------------------------------------------------------------------
-    # 3. Per-ball features
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 3 — Engineering per-ball features")
-    print("=" * 60)
-
-    # 3a  runs_remaining
-    chase["runs_remaining"] = chase["target_score"] - chase["cum_runs"]
-    print("  ✔ runs_remaining")
-
-    # 3b  balls_remaining
-    chase["balls_remaining"] = 120 - chase["balls_bowled"]
-    print("  ✔ balls_remaining")
-
-    # 3c  wickets_remaining
-    chase["wickets_remaining"] = 10 - chase["cum_wickets"]
-    print("  ✔ wickets_remaining")
-
-    # 3d  required_run_rate  (runs_remaining / overs_remaining)
-    overs_remaining = chase["balls_remaining"] / 6.0
-    chase["required_run_rate"] = np.where(
-        overs_remaining > 0,
-        chase["runs_remaining"] / overs_remaining,
-        0.0,
-    )
-    print("  ✔ required_run_rate")
-
-    # 3e  current_run_rate  (cum_runs / overs_bowled)
-    overs_bowled = chase["balls_bowled"] / 6.0
-    chase["current_run_rate"] = np.where(
-        overs_bowled > 0,
-        chase["cum_runs"] / overs_bowled,
-        0.0,
-    )
-    print("  ✔ current_run_rate")
-
-    # 3f  run_rate_diff
-    chase["run_rate_diff"] = (
-        chase["current_run_rate"] - chase["required_run_rate"]
-    )
-    print("  ✔ run_rate_diff")
-
-    # 3g  toss_advantage
-    chase["toss_advantage"] = (
-        chase["team_batting"].eq(chase["toss_winner"]).astype(int)
-    )
-    print("  ✔ toss_advantage")
-
-    # ------------------------------------------------------------------
-    # 4. Venue encoding (LabelEncoder → pkl)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 4 — Venue encoding")
-    print("=" * 60)
-
-    le_venue = LabelEncoder()
-    chase["venue_encoded"] = le_venue.fit_transform(
-        chase["venue"].astype(str)
-    )
-
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    joblib.dump(le_venue, VENUE_ENC_PKL)
-    print(f"  ✔ venue_encoded ({le_venue.classes_.shape[0]} unique venues)")
-    print(f"  ✔ Encoder saved → {VENUE_ENC_PKL}")
-
-    # ------------------------------------------------------------------
-    # 5. Team form (last 5 matches)
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 5 — Batting team form (last 5 matches)")
-    print("=" * 60)
-
-    form_dict = _team_form(df, n=5)
-    chase["batting_team_form"] = chase.apply(
-        lambda r: form_dict.get((r["team_batting"], r["match_id"]), 0.5),
-        axis=1,
-    )
-    print(f"  ✔ batting_team_form  (look-up size: {len(form_dict)})")
-
-    # ------------------------------------------------------------------
-    # 6. Head-to-head ratio
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 6 — Head-to-head win ratio")
-    print("=" * 60)
-
-    h2h_dict = _head_to_head(df)
-    chase["head_to_head_ratio"] = chase.apply(
-        lambda r: h2h_dict.get(
-            (r["team_batting"], r["team_bowling"], r["match_id"]), 0.5
-        ),
-        axis=1,
-    )
-    print(f"  ✔ head_to_head_ratio  (look-up size: {len(h2h_dict)})")
-
-    # ------------------------------------------------------------------
-    # 7. Drop NaN rows in any feature column
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 7 — Dropping NaN rows")
-    print("=" * 60)
-
-    feature_cols = [
-        "runs_remaining",
-        "balls_remaining",
-        "wickets_remaining",
-        "required_run_rate",
-        "current_run_rate",
-        "run_rate_diff",
-        "toss_advantage",
-        "venue_encoded",
-        "batting_team_form",
-        "head_to_head_ratio",
-        "batting_team_wins",
-    ]
-
-    before = len(chase)
-    chase.dropna(subset=feature_cols, inplace=True)
-    dropped = before - len(chase)
-    print(f"  ✔ Dropped {dropped} rows with NaN  →  {chase.shape}")
-
-    # ------------------------------------------------------------------
-    # 8. Save feature-engineered CSV
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 8 — Saving feature-engineered data")
-    print("=" * 60)
-
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
-    chase.to_csv(OUTPUT_CSV, index=False)
-    print(f"  ✔ Saved to {OUTPUT_CSV}")
-
-    # ------------------------------------------------------------------
-    # 9. Summary: shape, correlations, sample row
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 9 — Summary")
-    print("=" * 60)
-
-    print(f"\n  Shape: {chase.shape}")
-
-    print("\n  Feature correlations with batting_team_wins:")
-    corr = chase[feature_cols].corr()["batting_team_wins"].drop("batting_team_wins")
-    for feat, val in corr.sort_values(ascending=False).items():
-        print(f"    {feat:>25s}  {val:+.4f}")
-
-    print("\n  Sample row (feature columns):")
-    sample = chase[feature_cols].iloc[0]
-    for feat, val in sample.items():
-        print(f"    {feat:>25s}  {val}")
-
-    print("\n✅ Feature engineering complete!")
+    corr = table[C.FEATURE_COLS + [C.TARGET]].corr()[C.TARGET].drop(C.TARGET)
+    print("\n  correlation with 'chasing team wins':")
+    for name, val in corr.sort_values(ascending=False).items():
+        print(f"    {name:<22s}{val:+.3f}")
 
 
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     run()

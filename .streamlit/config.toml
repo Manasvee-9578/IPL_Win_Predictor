@@ -1,0 +1,24 @@
+[theme]
+base = "dark"
+primaryColor = "#1677D2"
+backgroundColor = "#0B1F4D"
+secondaryBackgroundColor = "#102A63"
+textColor = "#FFFFFF"
+font = "sans serif"
+baseRadius = "0.6rem"
+borderColor = "#2B4A8C"
+greenColor = "#1677D2"
+blueColor = "#1677D2"
+redColor = "#FF9933"
+orangeColor = "#FF9933"
+yellowColor = "#FF9933"
+violetColor = "#4DA3F5"
+grayColor = "#97A9CF"
+showWidgetBorder = true
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false

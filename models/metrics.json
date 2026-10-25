@@ -1,0 +1,202 @@
+{
+  "selected_model": "Blend (LR + XGBoost)",
+  "protocol": {
+    "model_selection": "fit seasons <=2019, validate 2020-2022",
+    "final_evaluation": "fit <=2022, test 2023-2025 (never used for tuning)"
+  },
+  "rows": {
+    "train": 101147,
+    "test": 23342,
+    "test_matches": 209
+  },
+  "candidates": {
+    "Logistic Regression": {
+      "validation": {
+        "accuracy": 0.8028182289457562,
+        "roc_auc": 0.8823986237098392,
+        "brier": 0.13809834305695773,
+        "log_loss": 0.42671827291663084
+      },
+      "test": {
+        "accuracy": 0.7872932910633194,
+        "roc_auc": 0.8748666223961516,
+        "brier": 0.1454888329433321,
+        "log_loss": 0.4446129289738729
+      }
+    },
+    "Random Forest": {
+      "validation": {
+        "accuracy": 0.7806682690041944,
+        "roc_auc": 0.8695984929907686,
+        "brier": 0.1485399619517106,
+        "log_loss": 0.45553444980414437
+      },
+      "test": {
+        "accuracy": 0.8036586410761717,
+        "roc_auc": 0.8767500577409454,
+        "brier": 0.1436517366788844,
+        "log_loss": 0.4501032147465419
+      }
+    },
+    "XGBoost (original settings)": {
+      "validation": {
+        "accuracy": 0.7933455865026627,
+        "roc_auc": 0.8745930701083419,
+        "brier": 0.14424335956573486,
+        "log_loss": 0.45415051963214903
+      },
+      "test": {
+        "accuracy": 0.794362094079342,
+        "roc_auc": 0.8741711882087122,
+        "brier": 0.14757885038852692,
+        "log_loss": 0.4656161835592209
+      }
+    },
+    "XGBoost (tuned + monotone)": {
+      "validation": {
+        "accuracy": 0.8025354634996936,
+        "roc_auc": 0.8808642017632826,
+        "brier": 0.14131644368171692,
+        "log_loss": 0.4329499177633182
+      },
+      "test": {
+        "accuracy": 0.8010453260217634,
+        "roc_auc": 0.8744008326606963,
+        "brier": 0.14346733689308167,
+        "log_loss": 0.4478083484812365
+      }
+    },
+    "Blend (LR + XGBoost)": {
+      "validation": {
+        "accuracy": 0.8014986568641312,
+        "roc_auc": 0.8849914738753307,
+        "brier": 0.13781175008265045,
+        "log_loss": 0.42333644245717456
+      },
+      "test": {
+        "accuracy": 0.7983891697369548,
+        "roc_auc": 0.8776060963706845,
+        "brier": 0.14272675090277895,
+        "log_loss": 0.4400252104574318
+      }
+    }
+  },
+  "test_by_stage": [
+    {
+      "stage": "Overs 0-5",
+      "accuracy": 0.7308815719596389,
+      "brier": 0.1829426029544058,
+      "rows": 7532
+    },
+    {
+      "stage": "Overs 6-10",
+      "accuracy": 0.7780808729139923,
+      "brier": 0.15491536096365577,
+      "rows": 6232
+    },
+    {
+      "stage": "Overs 11-15",
+      "accuracy": 0.8442035029190993,
+      "brier": 0.11965053838042276,
+      "rows": 5995
+    },
+    {
+      "stage": "Overs 16-20",
+      "accuracy": 0.8989673457996092,
+      "brier": 0.07559771895170088,
+      "rows": 3583
+    }
+  ],
+  "test_by_checkpoint": {
+    "after_0_overs": {
+      "accuracy": 0.6866359447004609,
+      "matches": 217
+    },
+    "after_5_overs": {
+      "accuracy": 0.7559808612440191,
+      "matches": 209
+    },
+    "after_10_overs": {
+      "accuracy": 0.7718446601941747,
+      "matches": 206
+    },
+    "after_15_overs": {
+      "accuracy": 0.8737373737373737,
+      "matches": 198
+    }
+  },
+  "calibration": [
+    {
+      "predicted": 0.0407381549973066,
+      "actual": 0.08262056414922657,
+      "count": 5495
+    },
+    {
+      "predicted": 0.14590023941547328,
+      "actual": 0.19359101420548397,
+      "count": 3027
+    },
+    {
+      "predicted": 0.24956435000596658,
+      "actual": 0.29331226961558715,
+      "count": 1899
+    },
+    {
+      "predicted": 0.3497985360528572,
+      "actual": 0.3964013086150491,
+      "count": 1834
+    },
+    {
+      "predicted": 0.4489551467181054,
+      "actual": 0.4696464309539693,
+      "count": 1499
+    },
+    {
+      "predicted": 0.5509007777176029,
+      "actual": 0.6145905024088094,
+      "count": 1453
+    },
+    {
+      "predicted": 0.6515524258003992,
+      "actual": 0.6978215038650738,
+      "count": 1423
+    },
+    {
+      "predicted": 0.7505955471574061,
+      "actual": 0.7890724269377383,
+      "count": 1574
+    },
+    {
+      "predicted": 0.8501294224197704,
+      "actual": 0.8770642201834863,
+      "count": 1635
+    },
+    {
+      "predicted": 0.9603465793793482,
+      "actual": 0.9557522123893806,
+      "count": 3503
+    }
+  ],
+  "feature_importance": {
+    "runs_remaining": 0.12827847323466704,
+    "balls_remaining": 0.058696130895457554,
+    "wickets_remaining": 0.07865237033320147,
+    "required_run_rate": 0.25551173622257195,
+    "current_run_rate": 0.03769787661890188,
+    "run_rate_diff": 0.23964199215523188,
+    "target_score": 0.07066853696270131,
+    "target_vs_venue": 0.044267008585135624,
+    "elo_diff": 0.022656325873508066,
+    "batting_team_form": 0.012507858182996818,
+    "head_to_head_ratio": 0.0177493639709636,
+    "venue_chase_bias": 0.012630976929636722,
+    "toss_advantage": 0.021041289499058695
+  },
+  "monotone_constraints": {
+    "runs_remaining": -1,
+    "required_run_rate": -1,
+    "wickets_remaining": 1,
+    "elo_diff": 1
+  },
+  "baseline_accuracy": 0.5314026218833006
+}

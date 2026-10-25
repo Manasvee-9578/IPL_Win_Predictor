@@ -19,9 +19,11 @@ __pycache__/
 .env.*
 
 # -------------------------
-# Data (large files)
+# Data (large files) - regenerate with `python -m src.run_pipeline`
+# (database/ipl.db and models/ ARE committed so the app runs out of the box)
 # -------------------------
 data/
+.pytest_cache/
 
 # -------------------------
 # Logs & temp

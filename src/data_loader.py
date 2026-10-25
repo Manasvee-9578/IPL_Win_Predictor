@@ -1,349 +1,174 @@
 """
-IPL Win Probability Predictor — Data Loader
-============================================
-Loads, cleans, merges and feature-engineers the IPL matches & deliveries
-CSVs and writes out a single analysis-ready file.
+ChaseIQ — Data Loader (stage 1 of the pipeline)
+=====================================================================
+Turns the two raw CSVs into two clean, analysis-ready tables:
+
+* ``matches_clean.csv``  – one row per match (teams, venue, toss, winner,
+                           1st-innings score, whether the chase is usable)
+* ``chase_states.csv``   – one row per *legal ball* of every usable 2nd
+                           innings, i.e. every "match situation" the model
+                           learns from.
+
+Cleaning decisions (and why)
+----------------------------
+* Super-over deliveries are removed – they are a different game.
+* Matches with no result / tied in regulation are removed – there is no
+  clean "chasing team won / lost" label.
+* Rain-shortened or otherwise interrupted innings are removed – a chase
+  that stops before the 20th over without a winner or all-out would teach
+  the model wrong lessons about what 120 balls means.
+* Terminal states (target reached, all out, 120 balls) are removed – the
+  outcome is already known, the API answers those deterministically.
+* Venues are mapped to canonical names (59 raw spellings -> ~35 grounds).
 
 Usage:
-    python src/data_loader.py
+    python -m src.data_loader
 """
 
-import os
 import sys
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Paths (relative to repo root)
-# ---------------------------------------------------------------------------
-RAW_DIR       = os.path.join("data", "raw")
-PROCESSED_DIR = os.path.join("data", "processed")
-MATCHES_CSV   = os.path.join(RAW_DIR, "matches.csv")
-DELIVERIES_CSV = os.path.join(RAW_DIR, "deliveries.csv")
-OUTPUT_CSV    = os.path.join(PROCESSED_DIR, "ipl_cleaned.csv")
+from src import config as C
+from src.reference import canonical_venue
+
+TOTAL_BALLS = C.TOTAL_BALLS
 
 
-# ---------------------------------------------------------------------------
-# Team-name standardisation mapping
-# ---------------------------------------------------------------------------
-TEAM_NAME_MAP = {
-    "Delhi Daredevils":              "Delhi Capitals",
-    "Kings XI Punjab":               "Punjab Kings",
-    "Deccan Chargers":               "Sunrisers Hyderabad",
-    "Rising Pune Supergiant":        "Rising Pune Supergiants",
-    "Royal Challengers Bangalore":   "Royal Challengers Bengaluru",
-}
+def load_raw() -> tuple[pd.DataFrame, pd.DataFrame]:
+    for path in (C.MATCHES_CSV, C.DELIVERIES_CSV):
+        if not path.is_file():
+            sys.exit(f"  x Missing raw file: {path}")
+    return pd.read_csv(C.MATCHES_CSV), pd.read_csv(C.DELIVERIES_CSV)
 
 
-# ---------------------------------------------------------------------------
-# Venue → City dictionary (fixes missing city values)
-# ---------------------------------------------------------------------------
-VENUE_CITY_MAP = {
-    "Dubai International Cricket Stadium": "Dubai",
-    "Sharjah Cricket Stadium":             "Sharjah",
-    "Sheikh Zayed Stadium":                "Abu Dhabi",
-    "Zayed Cricket Stadium, Abu Dhabi":    "Abu Dhabi",
-}
+def _innings_summary(deliv: pd.DataFrame, innings: int, prefix: str) -> pd.DataFrame:
+    """Final runs / wickets / legal balls / batting team of one innings per match."""
+    d = deliv[deliv["innings"] == innings].copy()
+    d["legal"] = (~d["is_wide_ball"] & ~d["is_no_ball"]).astype(int)
+    out = d.groupby("match_id").agg(
+        **{
+            f"{prefix}_team": ("team_batting", "first"),
+            f"{prefix}_runs": ("total_runs", "sum"),
+            f"{prefix}_wickets": ("is_wicket", "sum"),
+            f"{prefix}_balls": ("legal", "sum"),
+        }
+    )
+    return out.reset_index()
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _detect_match_id_col(df: pd.DataFrame, label: str) -> str:
-    """Return the first column name that looks like a match-ID field."""
-    candidates = ["match_id", "id", "ID", "Match_Id", "matchId"]
-    for c in candidates:
-        if c in df.columns:
-            print(f"  ✔ Detected match-ID column in {label}: '{c}'")
-            return c
-    raise KeyError(
-        f"Could not auto-detect a match-ID column in {label}. "
-        f"Available columns: {list(df.columns)}"
+def build_matches(matches: pd.DataFrame, deliv: pd.DataFrame) -> pd.DataFrame:
+    """One clean row per match with a ``valid_chase`` quality flag."""
+    m = matches.copy()
+    m["venue"] = m["venue"].map(canonical_venue)
+    m["season"] = m["season_id"].astype(int)
+    m = m.rename(columns={"match_winner": "winner"})
+
+    first = _innings_summary(deliv, 1, "first")
+    second = _innings_summary(deliv, 2, "chase")
+    m = m.merge(first, on="match_id", how="left").merge(second, on="match_id", how="left")
+
+    target = m["first_runs"] + 1
+    first_complete = (m["first_wickets"] >= 10) | (m["first_balls"] >= TOTAL_BALLS - 1)
+    chase_decided = (
+        (m["chase_runs"] >= target)
+        | (m["chase_wickets"] >= 10)
+        | (m["chase_balls"] >= TOTAL_BALLS - 1)
+    )
+    m["valid_chase"] = (
+        (m["result"] == "win")
+        & first_complete
+        & chase_decided
+        & m["chase_team"].notna()
+    )
+    m["chasing_team_won"] = (m["winner"] == m["chase_team"]).astype(int)
+
+    keep = [
+        "match_id", "season", "match_date", "city", "venue", "team1", "team2",
+        "toss_winner", "toss_decision", "winner", "result",
+        "first_team", "first_runs", "first_wickets", "first_balls",
+        "chase_team", "chase_runs", "chase_wickets", "chase_balls",
+        "win_by_runs", "win_by_wickets", "valid_chase", "chasing_team_won",
+    ]
+    m = m[keep].sort_values(["match_date", "match_id"]).reset_index(drop=True)
+    return m
+
+
+def build_chase_states(deliv: pd.DataFrame, matches: pd.DataFrame) -> pd.DataFrame:
+    """One non-terminal match situation per legal ball of every valid chase."""
+    valid = matches[matches["valid_chase"]].set_index("match_id")
+
+    d = deliv[(deliv["innings"] == 2) & deliv["match_id"].isin(valid.index)].copy()
+    d = d.sort_values(["match_id", "over_number", "ball_number"], kind="stable")
+    d["legal"] = (~d["is_wide_ball"] & ~d["is_no_ball"]).astype(int)
+    d["cum_runs"] = d.groupby("match_id")["total_runs"].cumsum()
+    d["cum_wickets"] = d.groupby("match_id")["is_wicket"].cumsum().astype(int)
+    d["balls_bowled"] = d.groupby("match_id")["legal"].cumsum()
+
+    # state after the last delivery that shares a legal-ball count
+    states = (
+        d.groupby(["match_id", "balls_bowled"], as_index=False)
+        .last()[["match_id", "balls_bowled", "cum_runs", "cum_wickets"]]
     )
 
+    # the pre-match situation: 0 balls, 0 runs, 0 wickets
+    start = pd.DataFrame({"match_id": valid.index, "balls_bowled": 0,
+                          "cum_runs": 0, "cum_wickets": 0})
+    states = pd.concat([start, states], ignore_index=True)
 
-def _standardise_teams(df: pd.DataFrame) -> pd.DataFrame:
-    """Replace legacy franchise names in every team-related column."""
-    team_cols = [
-        c for c in df.columns
-        if any(kw in c.lower() for kw in
-               ["team", "winner", "toss_winner", "batting", "bowling"])
-    ]
-    for col in team_cols:
-        if df[col].dtype == object:
-            df[col] = df[col].replace(TEAM_NAME_MAP)
-    return df
+    info = valid[["season", "venue", "chase_team", "first_team", "first_runs",
+                  "toss_winner", "winner", "match_date"]]
+    states = states.merge(info, left_on="match_id", right_index=True)
+    states["target_score"] = states["first_runs"] + 1
+    states["batting_team"] = states["chase_team"].astype(int)
+    states["bowling_team"] = states["first_team"].astype(int)
+    states[C.TARGET] = (states["winner"] == states["chase_team"]).astype(int)
+
+    # drop terminal states – their outcome is not a prediction problem
+    live = (
+        (states["cum_runs"] < states["target_score"])
+        & (states["cum_wickets"] < C.TOTAL_WICKETS)
+        & (states["balls_bowled"] < TOTAL_BALLS)
+    )
+    states = states[live].copy()
+    states["toss_advantage"] = (states["toss_winner"] == states["batting_team"]).astype(int)
+
+    cols = ["match_id", "season", "match_date", "venue", "batting_team", "bowling_team",
+            "target_score", "cum_runs", "cum_wickets", "balls_bowled",
+            "toss_advantage", C.TARGET]
+    return states[cols].sort_values(["match_id", "balls_bowled"]).reset_index(drop=True)
 
 
-# ===========================  MAIN PIPELINE  ==============================
 def run() -> None:
-    # ------------------------------------------------------------------
-    # 1. Load CSVs
-    # ------------------------------------------------------------------
-    print("=" * 60)
-    print("STEP 1 — Loading CSVs")
-    print("=" * 60)
+    print("=" * 60 + "\nSTAGE 1 - DATA LOADING & CLEANING\n" + "=" * 60)
+    matches_raw, deliv = load_raw()
+    print(f"  raw matches    : {matches_raw.shape}")
+    print(f"  raw deliveries : {deliv.shape}")
 
-    try:
-        matches = pd.read_csv(MATCHES_CSV)
-        print(f"  ✔ Loaded matches.csv  →  {matches.shape}")
-    except FileNotFoundError:
-        sys.exit(f"  ✖ File not found: {MATCHES_CSV}")
+    deliv = deliv[~deliv["is_super_over"]].copy()
+    for col in ("is_wide_ball", "is_no_ball", "is_wicket"):
+        deliv[col] = deliv[col].astype(bool)
+    print(f"  deliveries after removing super overs : {len(deliv):,}")
 
-    try:
-        deliveries = pd.read_csv(DELIVERIES_CSV)
-        print(f"  ✔ Loaded deliveries.csv  →  {deliveries.shape}")
-    except FileNotFoundError:
-        sys.exit(f"  ✖ File not found: {DELIVERIES_CSV}")
+    matches = build_matches(matches_raw, deliv)
+    n_valid = int(matches["valid_chase"].sum())
+    print(f"  matches        : {len(matches)}  (usable chases: {n_valid})")
+    print(f"  venues         : {matches_raw['venue'].nunique()} raw -> "
+          f"{matches['venue'].nunique()} canonical")
+    print("  excluded       :",
+          matches.loc[~matches['valid_chase'], 'result'].value_counts().to_dict())
 
-    # ------------------------------------------------------------------
-    # 2. Print all column names
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 2 — Column names")
-    print("=" * 60)
-    print(f"\n  matches.csv columns ({len(matches.columns)}):")
-    for col in matches.columns:
-        print(f"    • {col}")
+    states = build_chase_states(deliv, matches)
+    print(f"  chase states   : {len(states):,} rows "
+          f"({states['match_id'].nunique()} matches, "
+          f"{states[C.TARGET].mean():.1%} chasing-team wins)")
 
-    print(f"\n  deliveries.csv columns ({len(deliveries.columns)}):")
-    for col in deliveries.columns:
-        print(f"    • {col}")
-
-    # ------------------------------------------------------------------
-    # 3. Auto-detect match-ID column
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 3 — Auto-detecting match-ID column")
-    print("=" * 60)
-    try:
-        mid_matches = _detect_match_id_col(matches, "matches")
-        mid_deliveries = _detect_match_id_col(deliveries, "deliveries")
-    except KeyError as e:
-        sys.exit(str(e))
-
-    # ------------------------------------------------------------------
-    # 4. Remove no-result & D/L affected matches
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 4 — Removing no-result & D/L matches")
-    print("=" * 60)
-    before = len(matches)
-
-    # 4a  No-result
-    if "result" in matches.columns:
-        matches = matches[matches["result"] != "no result"]
-        print(f"  ✔ Dropped no-result matches  ({before - len(matches)} removed)")
-    else:
-        print("  ⚠ 'result' column not found — skipping no-result filter")
-
-    # 4b  Duckworth-Lewis
-    dl_cols = ["method", "dl_applied", "DL Applied", "dl"]
-    dl_col_found = None
-    for dc in dl_cols:
-        if dc in matches.columns:
-            dl_col_found = dc
-            break
-
-    if dl_col_found is not None:
-        before_dl = len(matches)
-        # Covers both string ("D/L") and int (1) indicators
-        if matches[dl_col_found].dtype == object:
-            matches = matches[
-                matches[dl_col_found].isna()
-                | (matches[dl_col_found].str.upper() == "NA")
-                | (matches[dl_col_found] == "")
-            ]
-        else:
-            matches = matches[matches[dl_col_found] != 1]
-        print(f"  ✔ Dropped D/L matches using '{dl_col_found}'  "
-              f"({before_dl - len(matches)} removed)")
-    else:
-        print("  ⚠ No D/L column found — skipping D/L filter")
-
-    print(f"  → Matches remaining: {len(matches)}")
-
-    # ------------------------------------------------------------------
-    # 5. Standardise team names
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 5 — Standardising team names")
-    print("=" * 60)
-    matches = _standardise_teams(matches)
-    deliveries = _standardise_teams(deliveries)
-    print("  ✔ Team names standardised in both DataFrames")
-
-    # ------------------------------------------------------------------
-    # 6. Fix missing city values using venue→city map
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 6 — Fixing missing city values")
-    print("=" * 60)
-
-    if "city" in matches.columns and "venue" in matches.columns:
-        missing_before = matches["city"].isna().sum()
-        matches["city"] = matches.apply(
-            lambda row: VENUE_CITY_MAP.get(row["venue"], row["city"])
-            if pd.isna(row["city"]) else row["city"],
-            axis=1,
-        )
-        fixed = missing_before - matches["city"].isna().sum()
-        print(f"  ✔ Fixed {fixed} missing city values  "
-              f"(remaining NaN: {matches['city'].isna().sum()})")
-    else:
-        print("  ⚠ 'city' or 'venue' column not found — skipping city fix")
-
-    # ------------------------------------------------------------------
-    # 7. Merge deliveries with matches
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 7 — Merging deliveries with matches")
-    print("=" * 60)
-
-    try:
-        merged = deliveries.merge(
-            matches,
-            left_on=mid_deliveries,
-            right_on=mid_matches,
-            how="inner",
-            suffixes=("", "_match"),
-        )
-        print(f"  ✔ Merged shape: {merged.shape}")
-    except Exception as e:
-        sys.exit(f"  ✖ Merge failed: {e}")
-
-    # ------------------------------------------------------------------
-    # 8. Cumulative columns per ball per innings
-    #    cum_runs, cum_wickets, balls_bowled
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 8 — Creating cumulative columns")
-    print("=" * 60)
-
-    try:
-        # Determine the innings grouping column
-        innings_col = None
-        for candidate in ["innings", "inning", "innings_number"]:
-            if candidate in merged.columns:
-                innings_col = candidate
-                break
-
-        if innings_col is None:
-            print("  ⚠ No innings column found — grouping by match_id only")
-            group_keys = [mid_deliveries]
-        else:
-            group_keys = [mid_deliveries, innings_col]
-
-        # Sort to guarantee correct cumulative order
-        sort_cols = group_keys.copy()
-        if "over_number" in merged.columns:
-            sort_cols.append("over_number")
-        if "ball_number" in merged.columns:
-            sort_cols.append("ball_number")
-        merged = merged.sort_values(sort_cols).reset_index(drop=True)
-
-        # -- cum_runs
-        runs_col = "total_runs" if "total_runs" in merged.columns else None
-        if runs_col:
-            merged["cum_runs"] = merged.groupby(group_keys)[runs_col].cumsum()
-            print(f"  ✔ cum_runs  (based on '{runs_col}')")
-        else:
-            print("  ⚠ 'total_runs' not found — cum_runs skipped")
-
-        # -- cum_wickets
-        wicket_col = "is_wicket" if "is_wicket" in merged.columns else None
-        if wicket_col:
-            merged["cum_wickets"] = (
-                merged.groupby(group_keys)[wicket_col].cumsum().astype(int)
-            )
-            print(f"  ✔ cum_wickets  (based on '{wicket_col}')")
-        else:
-            print("  ⚠ 'is_wicket' not found — cum_wickets skipped")
-
-        # -- balls_bowled (count of legal deliveries)
-        #    Exclude wides and no-balls when the columns exist
-        if "is_wide_ball" in merged.columns:
-            is_legal = (~merged["is_wide_ball"].astype(bool))
-        else:
-            is_legal = pd.Series(True, index=merged.index)
-
-        if "is_no_ball" in merged.columns:
-            is_legal = is_legal & (~merged["is_no_ball"].astype(bool))
-
-        merged["is_legal"] = is_legal.astype(int)
-        merged["balls_bowled"] = (
-            merged.groupby(group_keys)["is_legal"].cumsum().astype(int)
-        )
-        merged.drop(columns=["is_legal"], inplace=True)
-        print("  ✔ balls_bowled  (legal deliveries only)")
-
-    except Exception as e:
-        print(f"  ⚠ Error creating cumulative columns: {e}")
-
-    # ------------------------------------------------------------------
-    # 9. Target label: batting_team_wins
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 9 — Creating target label (batting_team_wins)")
-    print("=" * 60)
-
-    batting_col = None
-    for candidate in ["team_batting", "batting_team", "BattingTeam"]:
-        if candidate in merged.columns:
-            batting_col = candidate
-            break
-
-    winner_col = None
-    # Check both original and merge-suffixed names
-    for candidate in ["match_winner", "winner", "Winner",
-                       "match_winner_match", "winner_match", "Winner_match"]:
-        if candidate in merged.columns:
-            winner_col = candidate
-            break
-
-    if batting_col and winner_col:
-        merged["batting_team_wins"] = (
-            merged[batting_col].eq(merged[winner_col]).astype(int)
-        )
-        print(f"  ✔ batting_team_wins created  "
-              f"('{batting_col}' == '{winner_col}')")
-    else:
-        missing = []
-        if not batting_col:
-            missing.append("batting_team")
-        if not winner_col:
-            missing.append("winner")
-        print(f"  ⚠ Could not create target — missing column(s): {missing}")
-
-    # ------------------------------------------------------------------
-    # 10. Save cleaned CSV
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 10 — Saving cleaned dataframe")
-    print("=" * 60)
-
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
-    try:
-        merged.to_csv(OUTPUT_CSV, index=False)
-        print(f"  ✔ Saved to {OUTPUT_CSV}")
-    except Exception as e:
-        sys.exit(f"  ✖ Failed to save: {e}")
-
-    # ------------------------------------------------------------------
-    # 11. Final summary
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("STEP 11 — Final summary")
-    print("=" * 60)
-    print(f"  Shape: {merged.shape}")
-    if "batting_team_wins" in merged.columns:
-        print(f"\n  batting_team_wins value_counts:")
-        vc = merged["batting_team_wins"].value_counts()
-        for val, count in vc.items():
-            print(f"    {val}: {count}")
-    print("\n✅ Pipeline complete!")
+    C.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    matches.to_csv(C.MATCHES_CLEAN_CSV, index=False)
+    states.to_csv(C.CHASE_STATES_CSV, index=False)
+    print(f"  saved -> {C.MATCHES_CLEAN_CSV.name}, {C.CHASE_STATES_CSV.name}")
 
 
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     run()
